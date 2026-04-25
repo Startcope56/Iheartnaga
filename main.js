@@ -49,7 +49,16 @@ const ADMIN_UID = "61588479630286";
 const POST_INTERVAL_MS = 8 * 60 * 1000;        // 8 minutes (base)
 const POST_JITTER_MS = 90 * 1000;              // ±90s jitter
 const APPSTATE_PATH = path.join(__dirname, "appstate.json");
+const APPSTATE_BACKUP_PATH = path.join(__dirname, "appstate.backup.json");
 const TMP_DIR = path.join(__dirname, ".tmp");
+
+// Fallback credentials (loaded ONLY from Replit Secrets — NEVER hardcoded)
+const FB_EMAIL = process.env.FB_EMAIL || "";
+const FB_PASSWORD = process.env.FB_PASSWORD || "";
+
+// Hard daily/per-thread caps (extra Meta-flag protection)
+const MAX_POSTS_PER_DAY_PER_THREAD = 160;   // ~ every 9 minutes
+const MAX_POSTS_PER_HOUR_PER_THREAD = 10;
 
 const NEWS_API_URLS = [
   "https://newsdata.io/api/1/latest?apikey=pub_4b1ec47b99fd4f8a9be3475f69e0f979&q=Philippines",
@@ -79,18 +88,55 @@ const log = {
 // =====================================================================
 
 const REAL_USER_AGENTS = [
-  // Real Android Messenger / Chrome mobile
+  // Real Android Chrome mobile
   "Mozilla/5.0 (Linux; Android 13; SM-S918B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Mobile Safari/537.36",
   "Mozilla/5.0 (Linux; Android 12; Pixel 6) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36",
   "Mozilla/5.0 (Linux; Android 14; SM-A546E) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.6261.105 Mobile Safari/537.36",
   "Mozilla/5.0 (Linux; Android 13; M2102J20SG) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Mobile Safari/537.36",
-  // iPhone Safari + Messenger
+  "Mozilla/5.0 (Linux; Android 14; SM-S928B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.6367.82 Mobile Safari/537.36",
+  // Native Facebook for Android (FBAN/FB4A) — looks like the real FB app
+  "Mozilla/5.0 (Linux; Android 13; SM-A536E Build/TP1A.220624.014; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/120.0.0.0 Mobile Safari/537.36 [FB_IAB/FB4A;FBAV/450.0.0.38.115;]",
+  "Mozilla/5.0 (Linux; Android 12; SM-G998B Build/SP1A.210812.016; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/119.0.0.0 Mobile Safari/537.36 [FB_IAB/FB4A;FBAV/445.0.0.34.106;]",
+  // Messenger for Android
+  "Mozilla/5.0 (Linux; Android 13; SM-A346E Build/TP1A.220624.014; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/121.0.0.0 Mobile Safari/537.36 [FB_IAB/Orca-Android;FBAV/438.0.0.45.85;]",
+  // iPhone Safari + Messenger iOS
   "Mozilla/5.0 (iPhone; CPU iPhone OS 17_3 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.3 Mobile/15E148 Safari/604.1",
   "Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1",
+  "Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) FBAN/FBIOS;FBAV/451.0.0.34.107;FBBV/612024412;",
 ];
 
 function pickUA() {
   return REAL_USER_AGENTS[Math.floor(Math.random() * REAL_USER_AGENTS.length)];
+}
+
+// STICKY UA for the Facebook session — must stay identical across restarts,
+// otherwise FB invalidates the cookie ("logged in from unknown location").
+const UA_LOCK_PATH = path.join(__dirname, ".session-ua.lock");
+function getStickyUA() {
+  try {
+    if (fs.existsSync(UA_LOCK_PATH)) {
+      const v = fs.readFileSync(UA_LOCK_PATH, "utf8").trim();
+      if (v) return v;
+    }
+  } catch {
+    /* ignore */
+  }
+  const ua = pickUA();
+  try {
+    fs.writeFileSync(UA_LOCK_PATH, ua, "utf8");
+  } catch {
+    /* ignore */
+  }
+  log.stealth(`Sticky session UA locked to: ${ua.slice(0, 60)}...`);
+  return ua;
+}
+function rotateStickyUA() {
+  try {
+    fs.unlinkSync(UA_LOCK_PATH);
+  } catch {
+    /* ignore */
+  }
+  return getStickyUA();
 }
 
 function rand(min, max) {
@@ -445,68 +491,167 @@ function saveAppState(api) {
   }
 }
 
-function loginFB(appState) {
+function getLoginModule(preferredOrder) {
+  const tryModule = (name) => {
+    try {
+      return require(name);
+    } catch (e) {
+      log.warn(`Could not load module "${name}": ${e.message}`);
+      return null;
+    }
+  };
+  const candidates = preferredOrder || ["ws3-fca", "stfca"];
+  for (const c of candidates) {
+    const mod = tryModule(c);
+    if (mod) {
+      const login = typeof mod === "function" ? mod : mod.default || mod.login;
+      if (typeof login === "function") {
+        return { name: c, login };
+      }
+    }
+  }
+  return null;
+}
+
+function applyApiOptions(api, userAgent) {
+  try {
+    api.setOptions({
+      listenEvents: true,
+      selfListen: false,
+      autoMarkRead: false,        // we mark MANUALLY with delay
+      autoMarkDelivery: false,    // humanized
+      updatePresence: false,
+      forceLogin: true,
+      online: false,              // we flip presence ourselves
+      userAgent,
+    });
+  } catch {
+    /* ignore */
+  }
+}
+
+function loginWithAppState(appState, modName) {
   return new Promise((resolve, reject) => {
-    const tryModule = (name) => {
-      try {
-        return require(name);
-      } catch (e) {
-        log.warn(`Could not load module "${name}": ${e.message}`);
-        return null;
-      }
-    };
-
-    const candidates = ["ws3-fca", "stfca"];
-    let mod = null;
-    let chosen = null;
-    for (const c of candidates) {
-      mod = tryModule(c);
-      if (mod) {
-        chosen = c;
-        break;
-      }
-    }
-    if (!mod) {
-      reject(
-        new Error(
-          "Neither ws3-fca nor stfca is installed. Run: npm install ws3-fca stfca",
-        ),
-      );
+    const m = getLoginModule([modName || "ws3-fca", "stfca"]);
+    if (!m) {
+      reject(new Error("No FB login module installed (ws3-fca/stfca)."));
       return;
     }
-    log.info(`Using Facebook login module: ${chosen}`);
-
-    const login = typeof mod === "function" ? mod : mod.default || mod.login;
-    if (typeof login !== "function") {
-      reject(new Error(`Module "${chosen}" does not expose a login function.`));
-      return;
-    }
-
-    const userAgent = pickUA();
-    log.stealth(`Login UA = ${userAgent.slice(0, 60)}...`);
-
-    login({ appState }, (err, api) => {
-      if (err) {
-        reject(err);
-        return;
-      }
-      try {
-        api.setOptions({
-          listenEvents: true,
-          selfListen: false,
-          autoMarkRead: false,        // we'll mark read MANUALLY with delay
-          autoMarkDelivery: false,    // same — humanize it
-          updatePresence: false,
-          forceLogin: true,
-          online: false,              // start offline; we flip presence ourselves
-          userAgent,
-        });
-      } catch {
-        /* ignore */
-      }
+    const userAgent = getStickyUA(); // STICKY for session continuity
+    log.info(
+      `Login via ${m.name} using appstate. UA = ${userAgent.slice(0, 60)}...`,
+    );
+    m.login({ appState }, (err, api) => {
+      if (err) return reject(err);
+      applyApiOptions(api, userAgent);
       resolve(api);
     });
   });
+}
+
+function loginWithCredentials(email, password, modName) {
+  return new Promise((resolve, reject) => {
+    if (!email || !password) {
+      reject(new Error("FB_EMAIL / FB_PASSWORD secrets are not set."));
+      return;
+    }
+    const m = getLoginModule([modName || "ws3-fca", "stfca"]);
+    if (!m) {
+      reject(new Error("No FB login module installed (ws3-fca/stfca)."));
+      return;
+    }
+    // For credential-based login we use a freshly-rotated sticky UA so the
+    // resulting cookie is fingerprinted to the same UA we'll keep using.
+    const userAgent = rotateStickyUA();
+    log.stealth(
+      `Fallback login via ${m.name} using email+password. UA = ${userAgent.slice(0, 60)}...`,
+    );
+    m.login({ email, password }, (err, api) => {
+      if (err) return reject(err);
+      applyApiOptions(api, userAgent);
+      resolve(api);
+    });
+  });
+}
+
+async function loginFB() {
+  // 1. Try appstate first (least suspicious — mimics existing session)
+  let appState = null;
+  try {
+    appState = loadAppState();
+  } catch (e) {
+    log.warn(`Appstate unavailable: ${e.message}`);
+  }
+
+  if (appState) {
+    try {
+      const api = await loginWithAppState(appState);
+      log.ok("Logged in successfully using appstate.");
+      return api;
+    } catch (e) {
+      const m = String(e?.error || e?.message || e).toLowerCase();
+      log.warn(
+        `Appstate login failed: ${e?.error || e?.message || e}. Will try email/password fallback.`,
+      );
+      // backup the bad appstate so we don't lose it
+      try {
+        if (fs.existsSync(APPSTATE_PATH)) {
+          fs.copyFileSync(APPSTATE_PATH, APPSTATE_BACKUP_PATH);
+        }
+      } catch {
+        /* ignore */
+      }
+      // If it's a checkpoint/challenge, DON'T immediately try email login —
+      // that often triggers more flags. Wait first.
+      if (
+        m.includes("checkpoint") ||
+        m.includes("review") ||
+        m.includes("suspect") ||
+        m.includes("automated") ||
+        m.includes("disabled")
+      ) {
+        log.error(
+          "[stealth] Meta CHALLENGE detected on appstate login. Waiting 5 minutes before trying email/password fallback to avoid escalation.",
+        );
+        await sleep(5 * 60 * 1000);
+      } else {
+        // small random wait before fallback
+        await sleep(rand(15_000, 45_000));
+      }
+    }
+  }
+
+  // 2. Fallback: email + password (from Replit Secrets only)
+  if (!FB_EMAIL || !FB_PASSWORD) {
+    throw new Error(
+      "Cannot log in: appstate failed and FB_EMAIL/FB_PASSWORD secrets are not configured.",
+    );
+  }
+
+  // Try ws3-fca first for credential login, then stfca as last resort.
+  let api = null;
+  let lastErr = null;
+  for (const modName of ["ws3-fca", "stfca"]) {
+    try {
+      api = await loginWithCredentials(FB_EMAIL, FB_PASSWORD, modName);
+      log.ok(
+        `Logged in successfully via email+password fallback (using ${modName}).`,
+      );
+      break;
+    } catch (e) {
+      lastErr = e;
+      log.warn(
+        `Credential login via ${modName} failed: ${e?.error || e?.message || e}`,
+      );
+      // brief humanized pause before trying the other module
+      await sleep(rand(8000, 20000));
+    }
+  }
+  if (!api) throw lastErr || new Error("All credential logins failed.");
+
+  // Persist the freshly-issued appstate so future starts use it instead.
+  saveAppState(api);
+  return api;
 }
 
 // =====================================================================
@@ -726,6 +871,12 @@ async function runPostCycle(api) {
     const threads = Database.getEnabledThreads();
     if (threads.length === 0) return;
 
+    // STEALTH: 4% random "human break" — skip this cycle entirely.
+    if (Math.random() < 0.04) {
+      log.stealth("Random human-break: skipping this cycle (anti-pattern).");
+      return;
+    }
+
     const article = await getNextArticle();
     if (!article) {
       log.warn("No article available this cycle.");
@@ -737,10 +888,36 @@ async function runPostCycle(api) {
     const shuffled = [...threads].sort(() => Math.random() - 0.5);
     for (const threadId of shuffled) {
       if (safety.challengeMode) break;
+
+      // Per-thread daily/hourly caps — STRICT
+      const counts = Database.getThreadPostCounts(threadId);
+      if (counts.postsToday >= MAX_POSTS_PER_DAY_PER_THREAD) {
+        log.warn(
+          `[stealth] Thread ${threadId} hit DAILY cap (${counts.postsToday}/${MAX_POSTS_PER_DAY_PER_THREAD}) — skipping.`,
+        );
+        continue;
+      }
+      if (counts.postsThisHour >= MAX_POSTS_PER_HOUR_PER_THREAD) {
+        log.warn(
+          `[stealth] Thread ${threadId} hit HOURLY cap (${counts.postsThisHour}/${MAX_POSTS_PER_HOUR_PER_THREAD}) — skipping.`,
+        );
+        continue;
+      }
+      // Min 4 minutes between posts to the same thread
+      if (Date.now() - counts.lastPostAt < 4 * 60 * 1000) {
+        log.warn(
+          `[stealth] Thread ${threadId} posted recently — enforcing 4-min minimum gap.`,
+        );
+        continue;
+      }
+
       const ok = await postArticleToThread(api, threadId, article);
-      if (ok) postedAtLeastOnce = true;
-      // Random per-thread cool-down (4-13s) — humanized
-      await sleep(rand(4000, 13000));
+      if (ok) {
+        postedAtLeastOnce = true;
+        Database.recordThreadPost(threadId);
+      }
+      // Random per-thread cool-down (5-18s) — humanized
+      await sleep(rand(5000, 18000));
     }
 
     if (postedAtLeastOnce) Database.markPosted(article.article_id);
@@ -800,11 +977,14 @@ function startAppStateRefresher(api) {
 // LIFECYCLE / WATCHDOG
 // =====================================================================
 
+let listenerRetryTimer = null;
+
 function attachListener(api) {
   const handler = (err, event) => {
     if (err) {
       const m = String(err?.error || err?.message || err).toLowerCase();
       log.error("Listener error:", err?.error || err?.message || err);
+
       if (
         m.includes("not logged in") ||
         m.includes("login_required") ||
@@ -815,6 +995,35 @@ function attachListener(api) {
           "[stealth] Listener detected logout/challenge — will attempt relogin in 5 minutes.",
         );
         setTimeout(bootBot, 5 * 60_000);
+        return;
+      }
+
+      // "Failed to get sequence ID" / MQTT subscribe failure — retry quickly
+      // with humanized backoff (90-210s) instead of waiting ws3-fca's default.
+      if (
+        m.includes("sequence id") ||
+        m.includes("mqtt") ||
+        m.includes("connection") ||
+        m.includes("timeout")
+      ) {
+        if (!listenerRetryTimer) {
+          const wait = rand(90, 210) * 1000;
+          log.stealth(
+            `Listener subscribe failed — retrying attach in ${Math.round(
+              wait / 1000,
+            )}s (faster than ws3-fca's 42min default).`,
+          );
+          listenerRetryTimer = setTimeout(() => {
+            listenerRetryTimer = null;
+            try {
+              attachListener(api);
+              log.ok("Listener re-attached successfully.");
+            } catch (e) {
+              log.error("Listener re-attach failed:", e.message);
+            }
+          }, wait);
+        }
+        return;
       }
       return;
     }
@@ -840,22 +1049,9 @@ async function bootBot() {
     log.info(`Post interval: ~8 min (±90s jitter), 24/7`);
     log.info(`DB stats: ${JSON.stringify(Database.stats())}`);
 
-    let appState;
-    try {
-      appState = loadAppState();
-    } catch (e) {
-      log.error(e.message);
-      log.warn("Idle. Will retry in 60s after appstate is provided.");
-      setTimeout(() => {
-        bootInProgress = false;
-        bootBot();
-      }, 60_000);
-      return;
-    }
-
     let api;
     try {
-      api = await loginFB(appState);
+      api = await loginFB();
       log.ok(`Logged into Facebook as UID: ${api.getCurrentUserID?.()}`);
       safety.challengeMode = false;
       safety.consecFails = 0;

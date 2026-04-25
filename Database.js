@@ -16,8 +16,18 @@ const DEFAULT_DATA = {
   postedArticleIds: [],        // de-dup memory for news article IDs
   lastPostAt: 0,               // timestamp ms of last successful post
   totalPosts: 0,               // running counter
+  threadStats: {},             // per-thread counters: { [threadId]: { postsToday, postsThisHour, dayKey, hourKey, lastPostAt } }
   createdAt: Date.now(),
 };
+
+function dayKey(ts = Date.now()) {
+  const d = new Date(ts);
+  return `${d.getUTCFullYear()}-${d.getUTCMonth() + 1}-${d.getUTCDate()}`;
+}
+function hourKey(ts = Date.now()) {
+  const d = new Date(ts);
+  return `${dayKey(ts)}-${d.getUTCHours()}`;
+}
 
 let cache = null;
 let writeQueued = false;
@@ -124,6 +134,52 @@ const Database = {
       data.lastPostAt = Date.now();
       save();
     }
+  },
+
+  // -- per-thread post-rate accounting (anti-spam protection) --
+  recordThreadPost(threadId) {
+    const data = load();
+    if (!data.threadStats) data.threadStats = {};
+    const today = dayKey();
+    const hour = hourKey();
+    const s = data.threadStats[threadId] || {
+      postsToday: 0,
+      postsThisHour: 0,
+      dayKey: today,
+      hourKey: hour,
+      lastPostAt: 0,
+    };
+    if (s.dayKey !== today) {
+      s.dayKey = today;
+      s.postsToday = 0;
+    }
+    if (s.hourKey !== hour) {
+      s.hourKey = hour;
+      s.postsThisHour = 0;
+    }
+    s.postsToday += 1;
+    s.postsThisHour += 1;
+    s.lastPostAt = Date.now();
+    data.threadStats[threadId] = s;
+    save();
+    return s;
+  },
+  getThreadPostCounts(threadId) {
+    const data = load();
+    const today = dayKey();
+    const hour = hourKey();
+    const s = (data.threadStats || {})[threadId] || {
+      postsToday: 0,
+      postsThisHour: 0,
+      dayKey: today,
+      hourKey: hour,
+      lastPostAt: 0,
+    };
+    return {
+      postsToday: s.dayKey === today ? s.postsToday : 0,
+      postsThisHour: s.hourKey === hour ? s.postsThisHour : 0,
+      lastPostAt: s.lastPostAt || 0,
+    };
   },
 
   // -- stats --
