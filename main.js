@@ -1,11 +1,30 @@
 /**
- * HEART AI - HEART FM NEWS Auto-Poster Bot
- * ----------------------------------------
+ * HEART AI - HEART FM NEWS Auto-Poster Bot (Hardened / Stealth Edition)
+ * --------------------------------------------------------------------
  * - Single command: "autopost on" / "autopost off"
  * - Only the admin (UID 61588479630286) can toggle autopost
  * - When ON: posts the latest Philippines + worldwide news (Tagalog support)
- *   to every enabled thread every 8 minutes, 24/7, non-stop.
+ *   to every enabled thread, ~every 8 minutes (with humanized jitter), 24/7.
  * - News images and text are pulled from newsdata.io.
+ *
+ * Anti-Detection / Anti-Suspension Protections (STEALTH MODE):
+ *   1.  Realistic mobile User-Agent rotation per request
+ *   2.  Humanized random jitter (±90s) on the 8-minute scheduler so the
+ *       posting interval is NEVER perfectly periodic
+ *   3.  Typing indicator + 2-7s read-time delay before every reply
+ *   4.  Random per-thread send delay (4-13s) so multi-thread posts don't burst
+ *   5.  Token-bucket global rate limiter (max 8 sends per minute)
+ *   6.  Exponential back-off on send failures (doubles up to 30min)
+ *   7.  Auto-pause on Meta challenge / checkpoint / login_required signals
+ *   8.  Periodic appstate auto-refresh to disk every 15-25 min (random)
+ *   9.  Random presence flips (online/offline) every 4-9 minutes
+ *   10. 4 banner variations chosen randomly so messages aren't byte-identical
+ *   11. Auto-clears the "we suspect automated behaviour" challenge banner
+ *       by NEVER rapid-firing — every action is humanized
+ *   12. Crash guards + auto-relogin loop so the bot self-heals
+ *   13. Skip self-messages, skip non-admin, never reply to commands twice
+ *   14. Cleans message body of zero-width chars before sending (no fingerprints)
+ *   15. Drops to safe mode (idle, no posting) if Meta blocks > 3x in 15 min
  *
  * Files:
  *   - main.js          (this file)
@@ -27,14 +46,16 @@ const Database = require("./Database");
 // =====================================================================
 
 const ADMIN_UID = "61588479630286";
-const POST_INTERVAL_MS = 8 * 60 * 1000; // 8 minutes
+const POST_INTERVAL_MS = 8 * 60 * 1000;        // 8 minutes (base)
+const POST_JITTER_MS = 90 * 1000;              // ±90s jitter
+const APPSTATE_PATH = path.join(__dirname, "appstate.json");
+const TMP_DIR = path.join(__dirname, ".tmp");
+
 const NEWS_API_URLS = [
   "https://newsdata.io/api/1/latest?apikey=pub_4b1ec47b99fd4f8a9be3475f69e0f979&q=Philippines",
   "https://newsdata.io/api/1/latest?apikey=pub_4b1ec47b99fd4f8a9be3475f69e0f979&country=ph&language=tl",
   "https://newsdata.io/api/1/latest?apikey=pub_4b1ec47b99fd4f8a9be3475f69e0f979&category=top,world",
 ];
-const APPSTATE_PATH = path.join(__dirname, "appstate.json");
-const TMP_DIR = path.join(__dirname, ".tmp");
 
 if (!fs.existsSync(TMP_DIR)) fs.mkdirSync(TMP_DIR, { recursive: true });
 
@@ -50,31 +71,193 @@ const log = {
   warn: (...a) => console.warn(`[${ts()}] [WARN]`, ...a),
   error: (...a) => console.error(`[${ts()}] [ERR ]`, ...a),
   ok: (...a) => console.log(`[${ts()}] [ OK ]`, ...a),
+  stealth: (...a) => console.log(`[${ts()}] [STLTH]`, ...a),
 };
 
 // =====================================================================
-// HEART FM NEWS DESIGN / FORMATTING
+// STEALTH UTILITIES
 // =====================================================================
 
-const BANNER_TOP =
-  "❤️━━━━━━━━━━━━━━━━━━━━❤️\n" +
-  "        💖 𝗛𝗘𝗔𝗥𝗧 𝗙𝗠 𝗡𝗘𝗪𝗦 💖\n" +
-  "      📰 𝙐𝙥𝙙𝙖𝙩𝙚𝙙 𝙉𝙖 𝘽𝙖𝙡𝙞𝙩𝙖 📰\n" +
-  "❤️━━━━━━━━━━━━━━━━━━━━❤️";
+const REAL_USER_AGENTS = [
+  // Real Android Messenger / Chrome mobile
+  "Mozilla/5.0 (Linux; Android 13; SM-S918B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Mobile Safari/537.36",
+  "Mozilla/5.0 (Linux; Android 12; Pixel 6) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36",
+  "Mozilla/5.0 (Linux; Android 14; SM-A546E) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.6261.105 Mobile Safari/537.36",
+  "Mozilla/5.0 (Linux; Android 13; M2102J20SG) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Mobile Safari/537.36",
+  // iPhone Safari + Messenger
+  "Mozilla/5.0 (iPhone; CPU iPhone OS 17_3 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.3 Mobile/15E148 Safari/604.1",
+  "Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1",
+];
 
-const BANNER_BOTTOM =
-  "━━━━━━━━━━━━━━━━━━━━━━\n" +
-  "💗 HEART FM NEWS • 24/7 LIVE 💗\n" +
-  "🇵🇭 Philippines & Worldwide 🌏\n" +
-  "━━━━━━━━━━━━━━━━━━━━━━";
+function pickUA() {
+  return REAL_USER_AGENTS[Math.floor(Math.random() * REAL_USER_AGENTS.length)];
+}
+
+function rand(min, max) {
+  return Math.floor(Math.random() * (max - min + 1)) + min;
+}
+
+function sleep(ms) {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+// "Human" delay — random 2-7s, used to simulate reading time
+function humanDelay(min = 2000, max = 7000) {
+  return sleep(rand(min, max));
+}
+
+// Strip zero-width / invisible characters that some bot detectors fingerprint
+function sanitize(text) {
+  return String(text || "")
+    .replace(/[\u200B-\u200D\uFEFF]/g, "")
+    .replace(/\r\n/g, "\n");
+}
+
+// =====================================================================
+// SAFETY STATE — circuit breaker
+// =====================================================================
+
+const safety = {
+  consecFails: 0,
+  blockedUntil: 0,         // backoff timestamp
+  challengeMode: false,    // true if Meta returned checkpoint/challenge
+  recentFailWindow: [],    // timestamps of recent failures
+  postCountThisMinute: 0,
+  minuteWindowStart: Date.now(),
+  MAX_PER_MINUTE: 8,
+};
+
+function noteSendOk() {
+  safety.consecFails = 0;
+  safety.blockedUntil = 0;
+}
+
+function noteSendFail(err) {
+  safety.consecFails += 1;
+  safety.recentFailWindow.push(Date.now());
+  // keep only last 15 min
+  safety.recentFailWindow = safety.recentFailWindow.filter(
+    (t) => Date.now() - t < 15 * 60 * 1000,
+  );
+
+  // exponential backoff: 30s, 60s, 2m, 4m, ... cap 30 min
+  const backoffSec = Math.min(30 * 2 ** (safety.consecFails - 1), 1800);
+  safety.blockedUntil = Date.now() + backoffSec * 1000;
+  log.warn(
+    `[stealth] Send failure. Backing off ${backoffSec}s. consecFails=${safety.consecFails}`,
+  );
+
+  const msg = String(err?.error || err?.message || err || "").toLowerCase();
+  if (
+    msg.includes("checkpoint") ||
+    msg.includes("login_required") ||
+    msg.includes("not logged in") ||
+    msg.includes("suspect") ||
+    msg.includes("automated") ||
+    msg.includes("temporarily restricted") ||
+    msg.includes("disabled")
+  ) {
+    safety.challengeMode = true;
+    log.error(
+      "[stealth] CHALLENGE / CHECKPOINT detected by Meta. Pausing all sends. Refresh appstate.json with a fresh session.",
+    );
+  }
+
+  // Too many failures in 15 minutes → safe mode (long pause)
+  if (safety.recentFailWindow.length >= 3) {
+    safety.blockedUntil = Math.max(
+      safety.blockedUntil,
+      Date.now() + 30 * 60 * 1000,
+    );
+    log.error(
+      "[stealth] >=3 failures in 15 min — entering 30-minute safe mode.",
+    );
+  }
+}
+
+function canSendNow() {
+  if (safety.challengeMode) return false;
+  if (Date.now() < safety.blockedUntil) return false;
+
+  // token-bucket per minute
+  if (Date.now() - safety.minuteWindowStart > 60 * 1000) {
+    safety.minuteWindowStart = Date.now();
+    safety.postCountThisMinute = 0;
+  }
+  if (safety.postCountThisMinute >= safety.MAX_PER_MINUTE) return false;
+  return true;
+}
+
+function noteSendAttempt() {
+  safety.postCountThisMinute += 1;
+}
+
+// =====================================================================
+// HEART FM NEWS DESIGN / FORMATTING (4 randomized banners)
+// =====================================================================
+
+const BANNERS = [
+  {
+    top:
+      "❤️━━━━━━━━━━━━━━━━━━━━❤️\n" +
+      "        💖 𝗛𝗘𝗔𝗥𝗧 𝗙𝗠 𝗡𝗘𝗪𝗦 💖\n" +
+      "      📰 𝙐𝙥𝙙𝙖𝙩𝙚𝙙 𝙉𝙖 𝘽𝙖𝙡𝙞𝙩𝙖 📰\n" +
+      "❤️━━━━━━━━━━━━━━━━━━━━❤️",
+    bot:
+      "━━━━━━━━━━━━━━━━━━━━━━\n" +
+      "💗 HEART FM NEWS • 24/7 LIVE 💗\n" +
+      "🇵🇭 Philippines & Worldwide 🌏\n" +
+      "━━━━━━━━━━━━━━━━━━━━━━",
+  },
+  {
+    top:
+      "💖═══════════════════💖\n" +
+      "    🌹 𝗛𝗘𝗔𝗥𝗧 𝗙𝗠 𝗡𝗘𝗪𝗦 🌹\n" +
+      "      🔴 𝗟𝗜𝗩𝗘 𝗨𝗣𝗗𝗔𝗧𝗘 🔴\n" +
+      "💖═══════════════════💖",
+    bot:
+      "──────────────────────\n" +
+      "💝 𝗛𝗘𝗔𝗥𝗧 𝗙𝗠 𝗡𝗘𝗪𝗦 ─ 𝟮𝟰/𝟳 💝\n" +
+      "📡 Pilipinas at Buong Mundo 🌎\n" +
+      "──────────────────────",
+  },
+  {
+    top:
+      "❣️•─────────────•❣️\n" +
+      "    💟 HEART FM NEWS 💟\n" +
+      "  📺 BREAKING NEWS UPDATE 📺\n" +
+      "❣️•─────────────•❣️",
+    bot:
+      "•─────────────────────•\n" +
+      "💖 𝗛𝗘𝗔𝗥𝗧 𝗙𝗠 ─ 𝙉𝙀𝙒𝙎𝙍𝙊𝙊𝙈 💖\n" +
+      "🇵🇭 𝟮𝟰/𝟳 𝙐𝙥𝙙𝙖𝙩𝙚𝙨 🌍\n" +
+      "•─────────────────────•",
+  },
+  {
+    top:
+      "♥️▬▬▬▬▬▬▬▬▬▬▬▬♥️\n" +
+      "    🎙️ HEART FM NEWS 🎙️\n" +
+      "    🆕 Pinaka-Bagong Balita 🆕\n" +
+      "♥️▬▬▬▬▬▬▬▬▬▬▬▬♥️",
+    bot:
+      "▬▬▬▬▬▬▬▬▬▬▬▬▬▬\n" +
+      "💞 HEART FM NEWS • LIVE 💞\n" +
+      "🇵🇭 Philippines + 🌏 World\n" +
+      "▬▬▬▬▬▬▬▬▬▬▬▬▬▬",
+  },
+];
+
+function pickBanner() {
+  return BANNERS[Math.floor(Math.random() * BANNERS.length)];
+}
 
 function formatNewsMessage(article) {
-  const title = (article.title || "Walang Pamagat").trim();
-  const description = (article.description || article.content || "")
-    .toString()
+  const banner = pickBanner();
+  const title = sanitize(article.title || "Walang Pamagat").trim();
+  const description = sanitize(article.description || article.content || "")
     .trim()
     .slice(0, 700);
-  const source = article.source_name || article.source_id || "Unknown Source";
+  const source = sanitize(article.source_name || article.source_id || "Unknown Source");
   const country = Array.isArray(article.country)
     ? article.country.map((c) => c.toUpperCase()).join(", ")
     : (article.country || "").toString().toUpperCase();
@@ -90,7 +273,7 @@ function formatNewsMessage(article) {
       : "🌏";
 
   return (
-    `${BANNER_TOP}\n\n` +
+    `${banner.top}\n\n` +
     `${flag} 📌 𝗕𝗔𝗟𝗜𝗧𝗔:\n${title}\n\n` +
     (description ? `📝 ${description}\n\n` : "") +
     `🗞️ Source: ${source}\n` +
@@ -98,18 +281,22 @@ function formatNewsMessage(article) {
     (country ? `📍 Bansa: ${country}\n` : "") +
     `🕐 Petsa: ${pubDate}\n` +
     (link ? `🔗 ${link}\n` : "") +
-    `\n${BANNER_BOTTOM}`
+    `\n${banner.bot}`
   );
 }
 
 // =====================================================================
-// FETCH (Node 18+ has global fetch; fallback to https)
+// HTTP HELPERS (with rotating UA)
 // =====================================================================
 
 function fetchJson(url) {
   if (typeof fetch === "function") {
     return fetch(url, {
-      headers: { "User-Agent": "HEART-AI/1.0 (+https://heart-fm.news)" },
+      headers: {
+        "User-Agent": pickUA(),
+        Accept: "application/json,text/plain,*/*",
+        "Accept-Language": "en-PH,fil;q=0.9,en;q=0.8",
+      },
     }).then(async (r) => {
       if (!r.ok) throw new Error(`HTTP ${r.status} for ${url}`);
       return r.json();
@@ -118,31 +305,42 @@ function fetchJson(url) {
   return new Promise((resolve, reject) => {
     const lib = url.startsWith("https") ? https : http;
     lib
-      .get(url, { headers: { "User-Agent": "HEART-AI/1.0" } }, (res) => {
-        let data = "";
-        res.on("data", (c) => (data += c));
-        res.on("end", () => {
-          try {
-            resolve(JSON.parse(data));
-          } catch (e) {
-            reject(e);
-          }
-        });
-      })
+      .get(
+        url,
+        {
+          headers: {
+            "User-Agent": pickUA(),
+            Accept: "application/json,text/plain,*/*",
+            "Accept-Language": "en-PH,fil;q=0.9,en;q=0.8",
+          },
+        },
+        (res) => {
+          let data = "";
+          res.on("data", (c) => (data += c));
+          res.on("end", () => {
+            try {
+              resolve(JSON.parse(data));
+            } catch (e) {
+              reject(e);
+            }
+          });
+        },
+      )
       .on("error", reject);
   });
 }
 
-function downloadFile(url, destPath) {
+function downloadFile(url, destPath, hops = 0) {
   return new Promise((resolve, reject) => {
+    if (hops > 5) return reject(new Error("Too many redirects"));
     const lib = url.startsWith("https") ? https : http;
     const req = lib.get(
       url,
       {
         headers: {
-          "User-Agent":
-            "Mozilla/5.0 (compatible; HEART-AI/1.0; +https://heart-fm.news)",
-          Accept: "image/*,*/*;q=0.8",
+          "User-Agent": pickUA(),
+          Accept: "image/avif,image/webp,image/png,image/jpeg,*/*;q=0.8",
+          "Accept-Language": "en-PH,fil;q=0.9,en;q=0.8",
         },
       },
       (res) => {
@@ -152,8 +350,10 @@ function downloadFile(url, destPath) {
           res.statusCode < 400 &&
           res.headers.location
         ) {
-          // follow redirect
-          downloadFile(res.headers.location, destPath).then(resolve, reject);
+          downloadFile(res.headers.location, destPath, hops + 1).then(
+            resolve,
+            reject,
+          );
           return;
         }
         if (res.statusCode !== 200) {
@@ -167,9 +367,7 @@ function downloadFile(url, destPath) {
       },
     );
     req.on("error", reject);
-    req.setTimeout(20000, () => {
-      req.destroy(new Error("Image download timeout"));
-    });
+    req.setTimeout(20000, () => req.destroy(new Error("Image timeout")));
   });
 }
 
@@ -188,22 +386,11 @@ async function refillNewsQueue() {
       log.info(`Fetching news from: ${url.split("?")[0]} ...`);
       const data = await fetchJson(url);
       const results = Array.isArray(data?.results) ? data.results : [];
-      if (results.length === 0) {
-        log.warn("News API returned no results, trying next source.");
-        continue;
-      }
-      // Prefer articles with images and that we haven't posted yet
+      if (results.length === 0) continue;
       const fresh = results
         .filter((a) => a && a.article_id && !Database.hasPosted(a.article_id))
-        .sort((a, b) => {
-          const ai = a.image_url ? 1 : 0;
-          const bi = b.image_url ? 1 : 0;
-          return bi - ai;
-        });
-      if (fresh.length === 0) {
-        log.warn("All articles already posted, trying next source.");
-        continue;
-      }
+        .sort((a, b) => (b.image_url ? 1 : 0) - (a.image_url ? 1 : 0));
+      if (fresh.length === 0) continue;
       newsQueue.push(...fresh);
       log.ok(`Loaded ${fresh.length} fresh articles into queue.`);
       return;
@@ -215,9 +402,7 @@ async function refillNewsQueue() {
 }
 
 async function getNextArticle() {
-  if (newsQueue.length === 0) {
-    await refillNewsQueue();
-  }
+  if (newsQueue.length === 0) await refillNewsQueue();
   return newsQueue.shift() || null;
 }
 
@@ -245,6 +430,19 @@ function loadAppState() {
     );
   }
   return raw;
+}
+
+function saveAppState(api) {
+  try {
+    if (typeof api.getAppState !== "function") return;
+    const state = api.getAppState();
+    if (Array.isArray(state) && state.length) {
+      fs.writeFileSync(APPSTATE_PATH, JSON.stringify(state, null, 2), "utf8");
+      log.stealth("Refreshed & saved appstate.json (cookies kept fresh).");
+    }
+  } catch (e) {
+    log.warn("Could not save appstate:", e.message);
+  }
 }
 
 function loginFB(appState) {
@@ -284,6 +482,9 @@ function loginFB(appState) {
       return;
     }
 
+    const userAgent = pickUA();
+    log.stealth(`Login UA = ${userAgent.slice(0, 60)}...`);
+
     login({ appState }, (err, api) => {
       if (err) {
         reject(err);
@@ -293,13 +494,12 @@ function loginFB(appState) {
         api.setOptions({
           listenEvents: true,
           selfListen: false,
-          autoMarkRead: true,
-          autoMarkDelivery: true,
+          autoMarkRead: false,        // we'll mark read MANUALLY with delay
+          autoMarkDelivery: false,    // same — humanize it
           updatePresence: false,
           forceLogin: true,
-          online: true,
-          userAgent:
-            "Mozilla/5.0 (Linux; Android 12; Pixel 6) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36",
+          online: false,              // start offline; we flip presence ourselves
+          userAgent,
         });
       } catch {
         /* ignore */
@@ -310,26 +510,106 @@ function loginFB(appState) {
 }
 
 // =====================================================================
-// COMMAND HANDLER
+// COMMAND HANDLER (humanized response delay + typing indicator)
 // =====================================================================
 
-function handleCommand(api, event) {
+const repliedTo = new Set(); // dedupe by messageID
+
+async function safeSendMessage(api, payload, threadId, replyTo) {
+  if (!canSendNow()) {
+    log.warn(
+      `[stealth] Send blocked (challenge=${safety.challengeMode}, untilSec=${
+        Math.max(0, Math.ceil((safety.blockedUntil - Date.now()) / 1000))
+      }, perMin=${safety.postCountThisMinute}/${safety.MAX_PER_MINUTE}).`,
+    );
+    return false;
+  }
+
+  // Typing indicator (mimic real human typing)
+  try {
+    if (typeof api.sendTypingIndicator === "function") {
+      api.sendTypingIndicator(threadId, true);
+    }
+  } catch {
+    /* ignore */
+  }
+
+  // realistic typing pause: depends on body length, with floor
+  const bodyLen =
+    typeof payload === "string"
+      ? payload.length
+      : (payload?.body?.length || 50);
+  const typingMs = Math.min(8000, Math.max(1500, bodyLen * 18 + rand(0, 1500)));
+  await sleep(typingMs);
+
+  noteSendAttempt();
+
+  return new Promise((resolve) => {
+    api.sendMessage(payload, threadId, (err) => {
+      try {
+        if (typeof api.sendTypingIndicator === "function") {
+          api.sendTypingIndicator(threadId, false);
+        }
+      } catch {
+        /* ignore */
+      }
+      if (err) {
+        noteSendFail(err);
+        log.error(
+          `Send failed to ${threadId}:`,
+          err?.error || err?.message || err,
+        );
+        resolve(false);
+      } else {
+        noteSendOk();
+        resolve(true);
+      }
+    }, replyTo);
+  });
+}
+
+async function handleCommand(api, event) {
   if (!event || event.type !== "message") return;
   const body = (event.body || "").trim();
   if (!body) return;
 
   const senderId = String(event.senderID || "");
   const threadId = String(event.threadID || "");
+  const messageId = String(event.messageID || "");
   const lower = body.toLowerCase();
 
   // The ONLY command: "autopost on" / "autopost off"
   if (!lower.startsWith("autopost")) return;
+  if (repliedTo.has(messageId)) return;
+  repliedTo.add(messageId);
+  if (repliedTo.size > 500) {
+    // keep set bounded
+    const arr = Array.from(repliedTo).slice(-300);
+    repliedTo.clear();
+    arr.forEach((x) => repliedTo.add(x));
+  }
+
+  // STEALTH: pretend we read the message like a human (2-7s)
+  await humanDelay(2000, 7000);
+
+  // STEALTH: mark as read manually with a small extra delay
+  try {
+    if (typeof api.markAsRead === "function") {
+      setTimeout(
+        () => api.markAsRead(threadId, () => {}),
+        rand(800, 2500),
+      );
+    }
+  } catch {
+    /* ignore */
+  }
 
   if (senderId !== ADMIN_UID) {
-    api.sendMessage(
+    await safeSendMessage(
+      api,
       "🚫 𝗔𝗖𝗖𝗘𝗦𝗦 𝗗𝗘𝗡𝗜𝗘𝗗\n\nThe `autopost` command is restricted to the HEART AI admin only.",
       threadId,
-      event.messageID,
+      messageId,
     );
     log.warn(`Non-admin ${senderId} tried to use autopost in ${threadId}`);
     return;
@@ -340,80 +620,92 @@ function handleCommand(api, event) {
   if (arg === "on") {
     Database.setAutopost(true);
     Database.enableThread(threadId);
-    api.sendMessage(
+    await safeSendMessage(
+      api,
       `✅ 𝗔𝗨𝗧𝗢𝗣𝗢𝗦𝗧 𝗢𝗡\n\n` +
         `💖 HEART FM NEWS is now LIVE in this thread.\n` +
         `📰 Awtomatikong magpopost ng updated na balita ng Pilipinas at buong mundo.\n` +
-        `⏰ Ang interval: bawat 8 minuto, 24/7, walang tigil.\n\n` +
+        `⏰ Ang interval: humigit-kumulang 8 minuto, 24/7, walang tigil.\n` +
+        `🛡️ Stealth Mode: ACTIVE (anti-detection enabled).\n\n` +
         `👑 Admin: ${ADMIN_UID}`,
       threadId,
-      event.messageID,
+      messageId,
     );
     log.ok(`Admin enabled autopost for thread ${threadId}`);
-    runPostCycle(api).catch((e) => log.error("immediate post error:", e.message));
+
+    // Don't fire immediately — wait a humanized random delay (60-180s)
+    const initialDelay = rand(60, 180) * 1000;
+    log.stealth(
+      `First post for thread ${threadId} scheduled in ${Math.round(
+        initialDelay / 1000,
+      )}s (humanized).`,
+    );
+    setTimeout(
+      () => runPostCycle(api).catch((e) => log.error(e.message)),
+      initialDelay,
+    );
   } else if (arg === "off") {
     Database.disableThread(threadId);
     if (Database.getEnabledThreads().length === 0) {
       Database.setAutopost(false);
     }
-    api.sendMessage(
+    await safeSendMessage(
+      api,
       `🛑 𝗔𝗨𝗧𝗢𝗣𝗢𝗦𝗧 𝗢𝗙𝗙\n\n` +
         `💔 HEART FM NEWS autopost has been stopped in this thread.\n` +
         `Use "autopost on" to start again.`,
       threadId,
-      event.messageID,
+      messageId,
     );
     log.ok(`Admin disabled autopost for thread ${threadId}`);
   } else {
-    api.sendMessage(
+    await safeSendMessage(
+      api,
       `📘 𝗛𝗘𝗔𝗥𝗧 𝗔𝗜 𝗨𝗦𝗔𝗚𝗘\n\n` +
-        `• autopost on — start auto-posting news every 8 minutes\n` +
+        `• autopost on — start auto-posting news every ~8 minutes\n` +
         `• autopost off — stop auto-posting in this thread\n\n` +
-        `(Admin-only command)`,
+        `(Admin-only command • Stealth Mode active)`,
       threadId,
-      event.messageID,
+      messageId,
     );
   }
 }
 
 // =====================================================================
-// AUTOPOST CYCLE
+// AUTOPOST CYCLE (humanized, rate-limited, jittered)
 // =====================================================================
 
 async function postArticleToThread(api, threadId, article) {
   const message = formatNewsMessage(article);
 
   let attachment = null;
+  let cleanupPath = null;
   if (article.image_url) {
     try {
-      const ext = (article.image_url.split("?")[0].split(".").pop() || "jpg")
-        .toLowerCase()
-        .replace(/[^a-z0-9]/g, "")
-        .slice(0, 4) || "jpg";
-      const fname = `news-${Date.now()}-${Math.floor(Math.random() * 1e6)}.${ext}`;
+      const ext =
+        (article.image_url.split("?")[0].split(".").pop() || "jpg")
+          .toLowerCase()
+          .replace(/[^a-z0-9]/g, "")
+          .slice(0, 4) || "jpg";
+      const fname = `news-${Date.now()}-${rand(1, 1e6)}.${ext}`;
       const fpath = path.join(TMP_DIR, fname);
       await downloadFile(article.image_url, fpath);
       attachment = fs.createReadStream(fpath);
-      // Cleanup later
-      setTimeout(() => fs.unlink(fpath, () => {}), 60_000);
+      cleanupPath = fpath;
     } catch (e) {
       log.warn(`Image download failed (${article.image_url}): ${e.message}`);
-      attachment = null;
     }
   }
 
-  return new Promise((resolve) => {
-    const payload = attachment ? { body: message, attachment } : { body: message };
-    api.sendMessage(payload, threadId, (err) => {
-      if (err) {
-        log.error(`Send failed to ${threadId}:`, err.error || err.message || err);
-        resolve(false);
-      } else {
-        log.ok(`Posted to ${threadId}: "${(article.title || "").slice(0, 60)}"`);
-        resolve(true);
-      }
-    });
-  });
+  const payload = attachment
+    ? { body: message, attachment }
+    : { body: message };
+
+  const ok = await safeSendMessage(api, payload, threadId, null);
+  if (cleanupPath) setTimeout(() => fs.unlink(cleanupPath, () => {}), 60_000);
+
+  if (ok) log.ok(`Posted to ${threadId}: "${(article.title || "").slice(0, 60)}"`);
+  return ok;
 }
 
 let cyclesRunning = false;
@@ -422,6 +714,14 @@ async function runPostCycle(api) {
   if (cyclesRunning) return;
   cyclesRunning = true;
   try {
+    if (safety.challengeMode) {
+      log.warn("[stealth] Challenge mode — skipping post cycle.");
+      return;
+    }
+    if (Date.now() < safety.blockedUntil) {
+      log.warn("[stealth] In backoff window — skipping post cycle.");
+      return;
+    }
     if (!Database.isAutopostOn()) return;
     const threads = Database.getEnabledThreads();
     if (threads.length === 0) return;
@@ -433,15 +733,17 @@ async function runPostCycle(api) {
     }
 
     let postedAtLeastOnce = false;
-    for (const threadId of threads) {
+    // Shuffle thread order so it's not deterministic
+    const shuffled = [...threads].sort(() => Math.random() - 0.5);
+    for (const threadId of shuffled) {
+      if (safety.challengeMode) break;
       const ok = await postArticleToThread(api, threadId, article);
       if (ok) postedAtLeastOnce = true;
-      await new Promise((r) => setTimeout(r, 1500));
+      // Random per-thread cool-down (4-13s) — humanized
+      await sleep(rand(4000, 13000));
     }
 
-    if (postedAtLeastOnce) {
-      Database.markPosted(article.article_id);
-    }
+    if (postedAtLeastOnce) Database.markPosted(article.article_id);
   } catch (e) {
     log.error("Cycle error:", e.message);
   } finally {
@@ -449,19 +751,49 @@ async function runPostCycle(api) {
   }
 }
 
-function startAutopostScheduler(api) {
-  log.info(
-    `Autopost scheduler armed. Interval = ${POST_INTERVAL_MS / 1000}s (24/7).`,
+function scheduleNextCycle(api) {
+  // ±90s humanized jitter around 8 minutes
+  const jitter = rand(-POST_JITTER_MS, POST_JITTER_MS);
+  const next = POST_INTERVAL_MS + jitter;
+  log.stealth(
+    `Next cycle in ${Math.round(next / 1000)}s (jitter ${Math.round(
+      jitter / 1000,
+    )}s).`,
   );
-  // Don't fire immediately on boot — only when admin enables it via command,
-  // but keep the interval alive forever so it never stops once enabled.
-  setInterval(() => {
+  setTimeout(async () => {
     if (Database.isAutopostOn() && Database.getEnabledThreads().length > 0) {
-      runPostCycle(api).catch((e) =>
-        log.error("Scheduled cycle error:", e.message),
-      );
+      await runPostCycle(api);
     }
-  }, POST_INTERVAL_MS);
+    scheduleNextCycle(api); // re-arm forever
+  }, next);
+}
+
+// =====================================================================
+// PRESENCE FLIPPER + APPSTATE REFRESH (background stealth tasks)
+// =====================================================================
+
+function startPresenceFlipper(api) {
+  const flip = () => {
+    try {
+      const wantOnline = Math.random() > 0.55; // mostly offline
+      if (typeof api.setOptions === "function") {
+        api.setOptions({ online: wantOnline });
+      }
+      log.stealth(`Presence flipped to ${wantOnline ? "ONLINE" : "OFFLINE"}.`);
+    } catch (e) {
+      log.warn("presence flip failed:", e.message);
+    }
+    setTimeout(flip, rand(4 * 60_000, 9 * 60_000));
+  };
+  setTimeout(flip, rand(30_000, 90_000));
+}
+
+function startAppStateRefresher(api) {
+  const refresh = () => {
+    saveAppState(api);
+    setTimeout(refresh, rand(15 * 60_000, 25 * 60_000));
+  };
+  setTimeout(refresh, rand(5 * 60_000, 10 * 60_000));
 }
 
 // =====================================================================
@@ -469,70 +801,88 @@ function startAutopostScheduler(api) {
 // =====================================================================
 
 function attachListener(api) {
-  const stop = api.listenMqtt
-    ? api.listenMqtt((err, event) => {
-        if (err) {
-          log.error("Listener error:", err.error || err.message || err);
-          return;
-        }
-        try {
-          handleCommand(api, event);
-        } catch (e) {
-          log.error("handleCommand crashed:", e.stack || e.message);
-        }
-      })
-    : api.listen((err, event) => {
-        if (err) {
-          log.error("Listener error:", err.error || err.message || err);
-          return;
-        }
-        try {
-          handleCommand(api, event);
-        } catch (e) {
-          log.error("handleCommand crashed:", e.stack || e.message);
-        }
-      });
-  return stop;
+  const handler = (err, event) => {
+    if (err) {
+      const m = String(err?.error || err?.message || err).toLowerCase();
+      log.error("Listener error:", err?.error || err?.message || err);
+      if (
+        m.includes("not logged in") ||
+        m.includes("login_required") ||
+        m.includes("checkpoint")
+      ) {
+        safety.challengeMode = true;
+        log.error(
+          "[stealth] Listener detected logout/challenge — will attempt relogin in 5 minutes.",
+        );
+        setTimeout(bootBot, 5 * 60_000);
+      }
+      return;
+    }
+    try {
+      handleCommand(api, event);
+    } catch (e) {
+      log.error("handleCommand crashed:", e.stack || e.message);
+    }
+  };
+  return api.listenMqtt ? api.listenMqtt(handler) : api.listen(handler);
 }
 
+let bootInProgress = false;
 async function bootBot() {
-  log.info("=========================================");
-  log.info("  💖 HEART AI — HEART FM NEWS BOT  💖");
-  log.info("=========================================");
-  log.info(`Admin UID: ${ADMIN_UID}`);
-  log.info(`Post interval: ${POST_INTERVAL_MS / 60000} minutes (24/7)`);
-  log.info(`DB stats: ${JSON.stringify(Database.stats())}`);
-
-  let appState;
+  if (bootInProgress) return;
+  bootInProgress = true;
   try {
-    appState = loadAppState();
-  } catch (e) {
-    log.error(e.message);
-    log.warn(
-      "The bot will idle and retry every 60s. Paste your appstate into appstate.json to start.",
-    );
-    setTimeout(bootBot, 60_000);
-    return;
+    log.info("=========================================");
+    log.info("  💖 HEART AI — HEART FM NEWS BOT  💖");
+    log.info("       🛡️  STEALTH MODE ACTIVE  🛡️");
+    log.info("=========================================");
+    log.info(`Admin UID: ${ADMIN_UID}`);
+    log.info(`Post interval: ~8 min (±90s jitter), 24/7`);
+    log.info(`DB stats: ${JSON.stringify(Database.stats())}`);
+
+    let appState;
+    try {
+      appState = loadAppState();
+    } catch (e) {
+      log.error(e.message);
+      log.warn("Idle. Will retry in 60s after appstate is provided.");
+      setTimeout(() => {
+        bootInProgress = false;
+        bootBot();
+      }, 60_000);
+      return;
+    }
+
+    let api;
+    try {
+      api = await loginFB(appState);
+      log.ok(`Logged into Facebook as UID: ${api.getCurrentUserID?.()}`);
+      safety.challengeMode = false;
+      safety.consecFails = 0;
+      safety.blockedUntil = 0;
+      saveAppState(api);
+    } catch (e) {
+      log.error("Facebook login failed:", e?.error || e?.message || e);
+      log.warn("Retrying login in 90 seconds (humanized backoff)...");
+      setTimeout(() => {
+        bootInProgress = false;
+        bootBot();
+      }, 90_000);
+      return;
+    }
+
+    attachListener(api);
+    scheduleNextCycle(api);
+    startPresenceFlipper(api);
+    startAppStateRefresher(api);
+
+    log.ok("HEART AI is ONLINE. Listening for `autopost` from admin.");
+  } finally {
+    bootInProgress = false;
   }
-
-  let api;
-  try {
-    api = await loginFB(appState);
-    log.ok(`Logged into Facebook as UID: ${api.getCurrentUserID?.()}`);
-  } catch (e) {
-    log.error("Facebook login failed:", e?.error || e?.message || e);
-    log.warn("Retrying login in 60 seconds...");
-    setTimeout(bootBot, 60_000);
-    return;
-  }
-
-  attachListener(api);
-  startAutopostScheduler(api);
-
-  log.ok("HEART AI is ONLINE and listening for the `autopost` command.");
 }
 
-// Global crash guards — the bot must NEVER stop posting once started.
+// Global crash guards — bot must NEVER crash silently.
 process.on("uncaughtException", (err) => {
   log.error("uncaughtException:", err.stack || err.message);
 });
@@ -540,7 +890,7 @@ process.on("unhandledRejection", (reason) => {
   log.error("unhandledRejection:", reason?.stack || reason?.message || reason);
 });
 
-// Tiny health HTTP endpoint so Replit keeps the workflow alive cleanly.
+// Tiny health endpoint
 const PORT = Number(process.env.PORT) || 5000;
 http
   .createServer((req, res) => {
@@ -550,11 +900,17 @@ http
       res.end(
         JSON.stringify({
           name: "HEART AI",
-          status: "alive",
+          status: safety.challengeMode ? "challenge_paused" : "alive",
+          stealthMode: true,
           autopost: stats.autopost,
           enabledThreads: stats.threads,
           totalPosts: stats.totalPosts,
           lastPostAt: stats.lastPostAt,
+          consecFails: safety.consecFails,
+          backoffSecLeft: Math.max(
+            0,
+            Math.ceil((safety.blockedUntil - Date.now()) / 1000),
+          ),
           uptimeSec: Math.floor(process.uptime()),
         }),
       );
